@@ -1,0 +1,16 @@
+# 敏感配置与数据
+backend/.env
+backend/aiops.db
+*.db
+
+# 升级备份
+backup/
+
+# Python 缓存
+__pycache__/
+*.pyc
+venv/
+
+# 系统文件
+Thumbs.db
+.DS_Store

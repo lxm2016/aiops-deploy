@@ -1,0 +1,12 @@
+# AIOps 监控 Agent 配置文件
+server:
+  # 服务端上报接口地址
+  url: "http://SERVER:8080/api/servers/report"
+  # Agent 身份令牌, 需与服务端 agent_token 保持一致(请求头 X-Agent-Token)
+  token: "aiops-agent-shared-token"
+
+agent:
+  # 采集/上报间隔(秒), 默认 5 秒
+  interval: 5
+  # HTTP 请求超时(秒)
+  timeout: 10

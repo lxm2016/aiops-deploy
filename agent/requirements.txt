@@ -1,0 +1,5 @@
+# AIOps 监控 Agent 依赖
+# 注意: Windows Server 2008/2008R2 请使用 Python 3.8 及以下兼容版本
+psutil>=5.9.0
+requests>=2.28.0
+PyYAML>=6.0
