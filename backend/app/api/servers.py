@@ -1,4 +1,17 @@
-"""Server monitoring API: CRUD + agent metric ingestion + history."""
+"""Server monitoring API: CRUD + agent metric ingestion + history.
+
+── 稳定性修复说明 ──────────────────────────────────────────────
+1) get_metrics: 原实现先 SELECT 全部匹配行, 再在内存里 rows[::step] 降采样。
+   查询长周期(如 90 天)时会把上百万行、每行含 raw JSON 的记录一次性载入
+   内存, 既吃内存又耗时, 很容易超过前端 60 秒超时。
+   现改为: 按 collected_at 倒序取最近 N 行(默认 2 万)后再反转, 内存恒定可控,
+   且优先保留用户最关心的最新数据。
+
+2) report_metrics: raw 里原本每条都存 ports / services 全量列表, 但经全库
+   检索确认——没有任何后端代码或前端页面读取它们(前端仅使用 raw.disks)。
+   这部分正是历史表膨胀的主要来源, 现不再写入, 单条记录体积大幅下降。
+────────────────────────────────────────────────────────────────
+"""
 from datetime import datetime, timedelta
 from typing import List, Optional
 
@@ -84,16 +97,26 @@ async def get_metrics(
         hours = min(max(hours, 1), 24 * 90)  # 最长支持查询90天
         since = datetime.utcnow() - timedelta(hours=hours)
         conditions.append(ServerMetric.collected_at >= since)
+
+    # 关键: 先按时间倒序截断, 再反转回升序。避免一次性载入全量历史行。
+    max_rows = max(200, int(getattr(settings, "metrics_query_max_rows", 20000)))
     result = await db.execute(
         select(ServerMetric)
         .where(*conditions)
-        .order_by(ServerMetric.collected_at)
+        .order_by(ServerMetric.collected_at.desc())
+        .limit(max_rows)
     )
-    rows = result.scalars().all()
-    # 长时间范围自动降采样, 最多返回约2000个点, 避免前端图表卡死
+    rows = list(result.scalars().all())
+    rows.reverse()  # 恢复为时间升序, 供前端图表使用
+
+    # 再对已截断的结果做等间隔抽样, 保证返回点数适中
     step = max(1, len(rows) // 2000)
     if step > 1:
-        rows = rows[::step] + (rows[-1:] if (len(rows) - 1) % step else [])
+        sampled = rows[::step]
+        if sampled and sampled[-1] is not rows[-1]:
+            sampled.append(rows[-1])
+        rows = sampled
+
     # 附加各分区磁盘历史 (从raw.disks提取, 供前端分区分开画线)
     out = []
     for r in rows:
@@ -172,10 +195,11 @@ async def report_metrics(
         net_tx_mbps=data.net_tx_mbps,
         load_avg=data.load_avg,
         process_count=data.process_count,
+        # 只保留确实被消费的字段: 前端仅使用 disks 画分区曲线。
+        # ports / services 经全库检索无任何读取方, 原先每条都存一份,
+        # 是历史表体积膨胀的主要来源, 故不再写入。
         raw={
             "disks": data.disks,
-            "ports": data.ports,
-            "services": data.services,
             "hostname": data.hostname,
         },
         collected_at=datetime.utcnow(),

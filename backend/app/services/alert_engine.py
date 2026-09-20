@@ -1,5 +1,16 @@
-"""Alert engine: evaluates metrics against thresholds and raises alerts."""
+"""Alert engine: evaluates metrics against thresholds and raises alerts.
+
+── 稳定性修复说明 ──────────────────────────────────────────────
+原实现每次指标超阈值都无条件新增一条 Alert, 但 Agent 每 5 秒就该指标
+上报一次。若某台服务器 CPU 长期高于阈值, 一天就会写入上万条内容完全
+相同的重复告警 —— 既撑大 alerts 表, 也让告警中心充满噪音。
+
+现加入去重: 同一来源(source) + 同一指标若已存在未解决(open)的告警,
+则不再重复创建; 待原告警被「解决」后才允许再次触发。
+────────────────────────────────────────────────────────────────
+"""
 from datetime import datetime
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Alert
@@ -29,7 +40,21 @@ async def evaluate_server_metrics(
         else:
             continue
 
-        title = f"{server_name} {metric.replace('_percent', '')}使用率 {value:.1f}% 超过阈值"
+        # 去重: 同一服务器同一指标若已有未解决告警, 跳过本次创建
+        prefix = f"{server_name} {metric.replace('_percent', '')}使用率"
+        dup = await db.execute(
+            select(Alert.id)
+            .where(
+                Alert.status == "open",
+                Alert.source == server_name,
+                Alert.title.startswith(prefix),
+            )
+            .limit(1)
+        )
+        if dup.scalar_one_or_none() is not None:
+            continue
+
+        title = f"{prefix} {value:.1f}% 超过阈值"
         alert = Alert(
             level=level,
             category="server",
