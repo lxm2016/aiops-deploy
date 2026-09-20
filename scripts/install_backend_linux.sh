@@ -73,9 +73,18 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$BACKEND_DIR
-ExecStart=$BACKEND_DIR/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8080
+# 2个worker提高并发, WAL模式下SQLite支持多进程读; --timeout-graceful-shutdown 30 优雅关闭
+ExecStart=$BACKEND_DIR/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 2 --timeout-keep-alive 30 --timeout-graceful-shutdown 30 --limit-concurrency 200
 Restart=always
 RestartSec=5
+# 防止内存不足时被OOM Killer杀掉
+MemoryAccounting=yes
+# 重启前清理环境
+ExecStartPre=/bin/rm -f /tmp/aiops-backend.lock
+# 健康检查: 30秒无响应则强制重启
+WatchdogSec=30
+# 单进程最大运行时间72小时, 防止内存泄漏缓慢积累
+RuntimeMaxSec=72h
 
 [Install]
 WantedBy=multi-user.target

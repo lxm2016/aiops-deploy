@@ -238,6 +238,100 @@ class SystemConfig(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class TopologyRelation(Base):
+    """设备拓扑关系表"""
+    __tablename__ = "topology_relations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source_type = Column(String(32), nullable=False)  # server, network, storage, service
+    source_id = Column(Integer, nullable=False)     # 源设备ID
+    target_type = Column(String(32), nullable=False)  # server, network, storage, service
+    target_id = Column(Integer, nullable=False)     # 目标设备ID
+    relation_type = Column(String(32), nullable=False)  # depends_on, connected_to, hosted_on, monitored_by
+    strength = Column(Float, default=1.0)          # 关联强度 (0-1)
+    discovered_at = Column(DateTime, default=datetime.utcnow)
+    last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    extra_info = Column("metadata", Text)          # JSON格式的额外信息 (metadata是SQLAlchemy保留字, 属性名改用extra_info)
+
+
+class RootCauseAnalysis(Base):
+    """根因分析结果表"""
+    __tablename__ = "root_cause_analysis"
+
+    id = Column(Integer, primary_key=True, index=True)
+    alert_id = Column(Integer, nullable=True)        # 关联的告警ID
+    analysis_type = Column(String(32), nullable=False)  # topology, correlation, anomaly
+    analysis_result = Column(Text)                # 分析结果JSON
+    confidence_score = Column(Float, default=0.0)  # 置信度 0-1
+    root_cause = Column(Text)                      # 根因描述
+    affected_services = Column(Text)               # 受影响的服务列表JSON
+    recommendations = Column(Text)                 # 建议的解决方案
+    status = Column(String(16), default="pending")  # pending, completed, failed
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class KnowledgeBase(Base):
+    """RAG知识库"""
+    __tablename__ = "knowledge_base"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(256), nullable=False)
+    content = Column(Text, nullable=False)
+    category = Column(String(64), nullable=False)   # incident, solution, best_practice, manual
+    tags = Column(String(512))                     # 标签，逗号分隔
+    source = Column(String(128))                   # 知识来源
+    relevance_score = Column(Float, default=0.0)   # 相关性评分
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class WorkflowDefinition(Base):
+    """工作流定义"""
+    __tablename__ = "workflow_definitions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(128), nullable=False)
+    description = Column(Text)
+    definition = Column(Text, nullable=False)       # JSON格式的工作流定义
+    status = Column(String(16), default="active")  # active, inactive, draft
+    created_by = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class WorkflowExecution(Base):
+    """工作流执行记录"""
+    __tablename__ = "workflow_executions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workflow_id = Column(Integer, nullable=False)
+    trigger_type = Column(String(32), nullable=False)  # manual, alert, scheduled
+    trigger_data = Column(Text)                        # 触发数据JSON
+    status = Column(String(16), default="pending")     # pending, running, completed, failed
+    progress = Column(Integer, default=0)              # 进度百分比
+    result = Column(Text)                             # 执行结果JSON
+    error_message = Column(Text)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class SwitchPortMetric(Base):
+    """Time-series port traffic metrics."""
+    __tablename__ = "switch_port_metrics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    device_id = Column(Integer, nullable=False, index=True)
+    port_index = Column(Integer, nullable=False, index=True)
+    in_octets = Column(Integer, default=0)          # 接收字节数
+    out_octets = Column(Integer, default=0)         # 发送字节数
+    in_errors = Column(Integer, default=0)         # 接收错误数
+    out_errors = Column(Integer, default=0)        # 发送错误数
+    in_mbps = Column(Float, default=0.0)           # 接收速率(Mbps)
+    out_mbps = Column(Float, default=0.0)          # 发送速率(Mbps)
+    collected_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class User(Base):
     """Platform user."""
     __tablename__ = "users"

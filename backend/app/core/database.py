@@ -1,8 +1,9 @@
 """Async SQLAlchemy database setup."""
 import sqlite3
 
+from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.core.config import get_settings
 
@@ -10,6 +11,11 @@ settings = get_settings()
 
 engine = create_async_engine(settings.database_url, echo=False, future=True)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+# 同步会话 (供 port_traffic_service 等同步服务使用)
+_sync_url = settings.database_url.replace("+aiosqlite", "").replace("+asyncpg", "")
+sync_engine = create_engine(_sync_url, echo=False, future=True, connect_args={"check_same_thread": False} if _sync_url.startswith("sqlite") else {})
+SessionLocal = sessionmaker(bind=sync_engine, autoflush=False, expire_on_commit=False)
 
 
 class Base(DeclarativeBase):

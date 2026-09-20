@@ -9,7 +9,13 @@ from app.core.config import get_settings
 from app.core.database import AsyncSessionLocal
 from app.models import (
     Server, NetworkDevice, ServerMetric, EnvReading, VmwareHost, StorageDevice,
+    SwitchPortMetric,
 )
+from app.services.snmp_service import collect_network_device
+from app.services.storage_service import collect_storage
+from app.services.vmware_service import collect_vmware_data
+from app.services.port_traffic_service import PortTrafficService
+from app.services.port_traffic_service import PortTrafficService
 from app.services.snmp_service import collect_network_device
 from app.services.storage_service import collect_storage
 from app.services.vmware_service import collect_vmware_data
@@ -56,6 +62,10 @@ async def poll_all_network_devices():
                         d.port_up = data["port_up"]
                         d.last_seen = datetime.utcnow()
                         await upsert_ports(db, device.id, data["ports"])
+                        
+                        # 保存端口流量历史数据
+                        for port_data in data["ports"]:
+                            PortTrafficService.save_port_traffic(device.id, port_data)
                     await db.commit()
         except Exception:
             pass
@@ -122,6 +132,26 @@ async def sync_all_vmware():
             pass
 
 
+async def calculate_port_traffic_rates():
+    """计算端口流量速率"""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(NetworkDevice))
+        devices = result.scalars().all()
+    
+    for device in devices:
+        try:
+            PortTrafficService.calculate_port_traffic_rates(device.id, hours=24)
+            print(f"[INFO] 计算设备 {device.name} 端口流量速率完成")
+        except Exception as e:
+            print(f"[ERROR] 计算设备 {device.name} 端口流量速率失败: {e}")
+
+
+async def cleanup_port_traffic_metrics():
+    """清理超过保留期的端口流量历史数据"""
+    PortTrafficService.cleanup_old_data(days_to_keep=30)
+    print("[INFO] 清理端口流量历史数据完成")
+
+
 async def cleanup_old_metrics():
     """清理超过保留期(默认90天)的历史监控数据, 防止磁盘无限增长。"""
     threshold = datetime.utcnow() - timedelta(days=get_settings().metric_retention_days)
@@ -138,5 +168,7 @@ def start_scheduler():
     scheduler.add_job(poll_all_network_devices, "interval", minutes=2, id="snmp_poll")
     scheduler.add_job(poll_all_storage, "interval", minutes=5, id="storage_poll")
     scheduler.add_job(sync_all_vmware, "interval", minutes=5, id="vmware_sync")
+    scheduler.add_job(calculate_port_traffic_rates, "interval", minutes=5, id="port_rate_calc")
+    scheduler.add_job(cleanup_port_traffic_metrics, "interval", hours=6, id="port_traffic_cleanup")
     scheduler.add_job(cleanup_old_metrics, "interval", hours=6, id="metric_cleanup")
     scheduler.start()

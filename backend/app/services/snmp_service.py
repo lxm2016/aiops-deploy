@@ -20,6 +20,12 @@ OID_IF_OPER = "1.3.6.1.2.1.2.2.1.8"        # 端口运行状态
 OID_IF_SPEED = "1.3.6.1.2.1.2.2.1.5"       # 端口速率(bps)
 OID_IF_ALIAS = "1.3.6.1.2.1.31.1.1.1.18"   # 端口备注(ifAlias, 交换机上常写对端用途)
 
+# 端口流量统计OID (ifXTable)
+OID_IF_IN_OCTETS = "1.3.6.1.2.1.31.1.1.1.6"     # 接收字节数
+OID_IF_OUT_OCTETS = "1.3.6.1.2.1.31.1.1.1.10"    # 发送字节数
+OID_IF_IN_ERRORS = "1.3.6.1.2.1.31.1.1.1.8"     # 接收错误数
+OID_IF_OUT_ERRORS = "1.3.6.1.2.1.31.1.1.1.12"   # 发送错误数
+
 # ifOperStatus 数值 -> 中文
 PORT_STATUS_MAP = {
     1: "up", 2: "down", 3: "testing",
@@ -35,6 +41,11 @@ VENDOR_OIDS = {
     "h3c": {
         "cpu": "1.3.6.1.4.1.25506.2.6.1.1.1.1.6",      # hh3cEntityExtCpuUsage
         "mem": "1.3.6.1.4.1.25506.2.6.1.1.1.1.8",      # hh3cEntityExtMemUsage
+    },
+    # 通用的CPU内存OID (适用于大多数设备)
+    "generic": {
+        "cpu": "1.3.6.1.4.1.9.9.109.1.1.1.1.7",         # hrSystem. hrProcessorLoad
+        "mem": "1.3.6.1.4.1.9.9.48.1.1.1.5",          # hrSystem. hrMemorySize
     },
 }
 
@@ -129,6 +140,12 @@ async def walk_ports(ip: str, community: str, version: str = "2c") -> list:
     opers = await snmp_walk(ip, community, OID_IF_OPER, version)
     speeds = await snmp_walk(ip, community, OID_IF_SPEED, version)
     aliases = await snmp_walk(ip, community, OID_IF_ALIAS, version)
+    
+    # 获取流量统计
+    in_octets = await snmp_walk(ip, community, OID_IF_IN_OCTETS, version)
+    out_octets = await snmp_walk(ip, community, OID_IF_OUT_OCTETS, version)
+    in_errors = await snmp_walk(ip, community, OID_IF_IN_ERRORS, version)
+    out_errors = await snmp_walk(ip, community, OID_IF_OUT_ERRORS, version)
 
     ports = []
     for suffix, name in descrs.items():
@@ -137,14 +154,20 @@ async def walk_ports(ip: str, community: str, version: str = "2c") -> list:
         except ValueError:
             continue
         oper = _safe_int(opers.get(suffix))
-        ports.append({
+        port_data = {
             "port_index": index,
             "name": name,
             "status": PORT_STATUS_MAP.get(oper, "unknown"),
             "speed_mbps": _to_speed_mbps(speeds.get(suffix)),
             "alias": aliases.get(suffix, "") or "",
             "physical": 1 if is_physical_port(name) else 0,
-        })
+            # 流量统计
+            "in_octets": _safe_int(in_octets.get(suffix)),
+            "out_octets": _safe_int(out_octets.get(suffix)),
+            "in_errors": _safe_int(in_errors.get(suffix)),
+            "out_errors": _safe_int(out_errors.get(suffix)),
+        }
+        ports.append(port_data)
     ports.sort(key=lambda p: p["port_index"])
     return ports
 
@@ -224,19 +247,55 @@ async def collect_network_device(
         elif "h3c" in descr_lower or "hangzhou" in descr_lower:
             vendor_key = "h3c"
 
+    # 优先使用厂商特定OID，如果没有则使用通用OID
+    oids_to_try = []
     if vendor_key in VENDOR_OIDS:
-        cpu = await snmp_get_next(ip, community, VENDOR_OIDS[vendor_key]["cpu"], version)
-        mem = await snmp_get_next(ip, community, VENDOR_OIDS[vendor_key]["mem"], version)
-        if cpu:
-            try:
-                result["cpu_percent"] = float(cpu)
-            except ValueError:
-                pass
-        if mem:
-            try:
-                result["mem_percent"] = float(mem)
-            except ValueError:
-                pass
+        oids_to_try.append(vendor_key)
+    oids_to_try.append("generic")  # 尝试通用OID作为备选
+
+    for current_vendor in oids_to_try:
+        if current_vendor in VENDOR_OIDS:
+            cpu_oid = VENDOR_OIDS[current_vendor]["cpu"]
+            mem_oid = VENDOR_OIDS[current_vendor]["mem"]
+            
+            # 尝试获取CPU数据
+            cpu = await snmp_get_next(ip, community, cpu_oid, version)
+            if cpu:
+                try:
+                    result["cpu_percent"] = float(cpu)
+                    print(f"[DEBUG] CPU获取成功: {current_vendor} CPU={cpu}%")
+                except ValueError:
+                    print(f"[DEBUG] CPU数据转换失败: {cpu}")
+            else:
+                print(f"[DEBUG] CPU获取失败: {current_vendor} {cpu_oid}")
+            
+            # 尝试获取内存数据
+            if current_vendor == "generic":
+                # 通用OID中内存是总内存量，需要计算使用率
+                mem_total = await snmp_get_next(ip, community, mem_oid, version)
+                mem_used = await snmp_get_next(ip, community, "1.3.6.1.4.1.9.9.48.1.1.1.6", version)  # hrMemoryUsed
+                if mem_total and mem_used:
+                    try:
+                        total_bytes = int(float(mem_total)) * 1024  # 转换为字节
+                        used_bytes = int(float(mem_used)) * 1024
+                        if total_bytes > 0:
+                            result["mem_percent"] = (used_bytes / total_bytes) * 100
+                            print(f"[DEBUG] 内存使用率计算成功: {current_vendor} 内存={result['mem_percent']}%")
+                    except ValueError:
+                        print(f"[DEBUG] 内存数据转换失败")
+            else:
+                # 厂商特定OID直接返回使用率
+                mem = await snmp_get_next(ip, community, mem_oid, version)
+                if mem:
+                    try:
+                        result["mem_percent"] = float(mem)
+                        print(f"[DEBUG] 内存获取成功: {current_vendor} 内存={mem}%")
+                    except ValueError:
+                        print(f"[DEBUG] 内存数据转换失败: {mem}")
+            
+            # 如果获取到了数据就不再尝试其他OID
+            if result["cpu_percent"] > 0 or result["mem_percent"] > 0:
+                break
 
     # 端口明细 (名称/状态/速率/备注); UP/总 只统计物理口, 排除VLAN等虚拟口
     ports = await walk_ports(ip, community, version)
