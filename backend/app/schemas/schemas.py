@@ -299,6 +299,12 @@ class RackDeviceOut(BaseModel):
     side: str
     remark: str
     created_at: datetime
+    # 以下为与监控数据联动的派生字段(非数据库列), 由接口实时计算填充:
+    #   online / offline / warning / critical / unknown
+    status: Optional[str] = None
+    ip: Optional[str] = None            # 关联到的服务器IP
+    alert_level: Optional[str] = None   # 关联到的未恢复告警等级
+    alert_count: Optional[int] = 0      # 未恢复告警条数
 
     class Config:
         from_attributes = True

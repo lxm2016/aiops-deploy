@@ -6,7 +6,7 @@ from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import Rack, RackDevice
+from app.models import Rack, RackDevice, Server, Alert
 from app.schemas.schemas import (
     RackCreate, RackOut,
     RackDeviceCreate, RackDeviceOut,
@@ -17,6 +17,106 @@ router = APIRouter(prefix="/api", tags=["racks"])
 
 VALID_TYPES = {"server", "switch", "storage", "security", "other"}
 VALID_SIDES = {"front", "back"}
+
+
+# ============ 设备状态联动 ============
+# 机柜设备(RackDevice)本身只有台账信息, 没有状态列。这里把台账与实时监控
+# 数据关联起来, 让 3D/2D 视图里的状态灯反映真实情况 —— 否则告警高亮永远是摆设。
+#   1) 设备名/IP 匹配 servers 表  -> 在线 / 离线
+#   2) 设备名匹配 alerts 表未恢复告警 -> warning / critical
+
+_LEVEL_RANK = {"info": 0, "warning": 1, "critical": 2}
+_STATUS_RANK = {"unknown": 0, "online": 1, "offline": 2, "warning": 3, "critical": 4}
+
+
+async def _build_link_maps(db: AsyncSession):
+    """构建 (服务器映射, 未恢复告警映射)。"""
+    servers = (await db.execute(select(Server))).scalars().all()
+    srv_map: dict = {}
+    for s in servers:
+        for key in (s.name, s.ip):
+            k = str(key).strip().lower() if key else ""
+            if k and k not in srv_map:
+                srv_map[k] = s
+        # 主机名短名(去域名)也建索引, 提高匹配率
+        if s.name and "." in s.name:
+            short = s.name.split(".")[0].strip().lower()
+            if short and short not in srv_map:
+                srv_map[short] = s
+
+    alerts = (await db.execute(
+        select(Alert).where(Alert.status == "open")
+    )).scalars().all()
+    alert_map: dict = {}
+    for a in alerts:
+        key = (a.source or "").strip().lower()
+        if not key:
+            continue
+        lvl = (a.level or "info").lower()
+        cur_lvl, cur_cnt = alert_map.get(key, (None, 0))
+        if cur_lvl is None or _LEVEL_RANK.get(lvl, 0) > _LEVEL_RANK.get(cur_lvl, 0):
+            cur_lvl = lvl
+        alert_map[key] = (cur_lvl, cur_cnt + 1)
+
+    return srv_map, alert_map
+
+
+def _match_alert(alert_map: dict, dev_name: str):
+    """告警来源与设备名互为子串即视为命中。返回 (等级, 条数)。"""
+    key = (dev_name or "").strip().lower()
+    if not key:
+        return None, 0
+    if key in alert_map:
+        return alert_map[key]
+    for src, val in alert_map.items():
+        if src and (src in key or key in src):
+            return val
+    return None, 0
+
+
+def _calc_device_status(dev_name: str, srv_map: dict, alert_map: dict) -> dict:
+    """派生设备状态: critical > offline > warning > online > unknown。"""
+    key = (dev_name or "").strip().lower()
+    srv = srv_map.get(key)
+    lvl, cnt = _match_alert(alert_map, dev_name)
+
+    if lvl == "critical":
+        status = "critical"
+    elif srv is not None and srv.status == "offline":
+        status = "offline"
+    elif lvl == "warning":
+        status = "warning"
+    elif srv is not None and srv.status == "online":
+        status = "online"
+    elif srv is not None:
+        status = srv.status or "unknown"
+    else:
+        status = "unknown"
+
+    return {
+        "status": status,
+        "ip": srv.ip if srv else None,
+        "alert_level": lvl,
+        "alert_count": cnt,
+    }
+
+
+def _decorate(device: RackDevice, srv_map: dict, alert_map: dict) -> RackDeviceOut:
+    """把 ORM 对象转成带状态的出参模型。"""
+    item = RackDeviceOut.model_validate(device)
+    for k, v in _calc_device_status(device.name, srv_map, alert_map).items():
+        setattr(item, k, v)
+    return item
+
+
+def _rack_status(devices) -> str:
+    """机柜整体状态取其中设备的最高等级。"""
+    best = "unknown"
+    for d in devices:
+        s = getattr(d, "status", None) or "unknown"
+        if _STATUS_RANK.get(s, 0) > _STATUS_RANK.get(best, 0):
+            best = s
+    return best
 
 
 def _check_overlap(db_devices: list, u_start: int, u_size: int, side: str, exclude_id: int = None):
@@ -36,6 +136,53 @@ def _check_overlap(db_devices: list, u_start: int, u_size: int, side: str, exclu
 async def list_racks(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Rack).order_by(Rack.row_name, Rack.name))
     return result.scalars().all()
+
+
+@router.get("/racks/overview")
+async def racks_overview(db: AsyncSession = Depends(get_db)):
+    """一次返回 机柜列表 + 全量设备 + 统计。
+
+    前端原本要逐柜请求 devices(N+1), 机柜一多明显变慢;
+    这里合并为一次请求, 并附带机柜级状态供 3D 总览着色。
+    """
+    racks = (await db.execute(select(Rack).order_by(Rack.row_name, Rack.name))).scalars().all()
+    devices = (await db.execute(select(RackDevice).order_by(RackDevice.u_start))).scalars().all()
+    srv_map, alert_map = await _build_link_maps(db)
+
+    by_rack: dict = {}
+    for d in devices:
+        by_rack.setdefault(d.rack_id, []).append(_decorate(d, srv_map, alert_map))
+
+    rack_out = []
+    for r in racks:
+        devs = by_rack.get(r.id, [])
+        rack_out.append({
+            "id": r.id,
+            "name": r.name,
+            "row_name": r.row_name,
+            "u_height": r.u_height,
+            "remark": r.remark,
+            "device_count": len(devs),
+            "used_u": sum(d.u_size for d in devs if d.side == "front"),
+            "status": _rack_status(devs),
+        })
+
+    flat = [d for arr in by_rack.values() for d in arr]
+    cnt = lambda st: sum(1 for d in flat if d.status == st)  # noqa: E731
+
+    return {
+        "racks": rack_out,
+        "devices": {str(k): v for k, v in by_rack.items()},
+        "stats": {
+            "rack_count": len(racks),
+            "device_count": len(flat),
+            "online": cnt("online"),
+            "offline": cnt("offline"),
+            "warning": cnt("warning"),
+            "critical": cnt("critical"),
+            "unknown": cnt("unknown"),
+        },
+    }
 
 
 @router.post("/racks", response_model=RackOut)
@@ -95,7 +242,9 @@ async def list_rack_devices(rack_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(RackDevice).where(RackDevice.rack_id == rack_id).order_by(RackDevice.u_start)
     )
-    return result.scalars().all()
+    devices = result.scalars().all()
+    srv_map, alert_map = await _build_link_maps(db)
+    return [_decorate(d, srv_map, alert_map) for d in devices]
 
 
 @router.post("/racks/{rack_id}/devices", response_model=RackDeviceOut)
